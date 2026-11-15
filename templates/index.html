@@ -9,6 +9,7 @@
 
 <section class="stats" id="stats"></section>
 
+{% if user.role == 'admin' %}
 <div class="grid-2">
   <section class="card">
     <h2>Pengajuan menunggu persetujuan</h2>
@@ -20,12 +21,32 @@
     <div id="populer" class="table-wrap"></div>
   </section>
 </div>
+{% else %}
+<div class="grid-2">
+  <section class="card">
+    <h2>Peminjaman terbaru saya</h2>
+    <div id="saya" class="table-wrap"></div>
+    <p class="sub"><a href="/peminjaman">Lihat semua peminjaman saya &rarr;</a></p>
+  </section>
+  <section class="card">
+    <h2>Butuh ruangan?</h2>
+    <p>Cek ruangan yang kosong pada tanggal dan jam yang kamu mau, lalu ajukan langsung dari hasil pencariannya.</p>
+    <a class="btn" href="/ruangan">Cek ketersediaan ruangan</a>
+  </section>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
 <script>
 const STATUS = ["diajukan", "disetujui", "ditolak", "dibatalkan", "selesai"];
 
+function tampilStats(hitung) {
+  $("#stats").innerHTML = STATUS.map((s) =>
+    `<div class="stat ${s}"><span class="num">${hitung[s] || 0}</span><span class="lbl">${s}</span></div>`).join("");
+}
+
+{% if user.role == 'admin' %}
 guard(async () => {
   const [rekap, populer, pending] = await Promise.all([
     api("/laporan/rekap-status"),
@@ -33,9 +54,7 @@ guard(async () => {
     api("/peminjaman", { params: { status: "diajukan", limit: 6 } }),
   ]);
 
-  const hitung = Object.fromEntries(rekap.map((r) => [r.status, r.jumlah]));
-  $("#stats").innerHTML = STATUS.map((s) =>
-    `<div class="stat ${s}"><span class="num">${hitung[s] || 0}</span><span class="lbl">${s}</span></div>`).join("");
+  tampilStats(Object.fromEntries(rekap.map((r) => [r.status, r.jumlah])));
 
   renderTable($("#pending"), [
     { h: "Ruangan", f: (r) => `${esc(r.ruangan)}<div class="sub">${esc(r.gedung)}</div>` },
@@ -50,5 +69,20 @@ guard(async () => {
     { h: "Jam", cls: "num", f: (r) => r.total_jam },
   ], populer);
 });
+{% else %}
+guard(async () => {
+  // /peminjaman otomatis hanya mengembalikan milik user yang login
+  const semua = await api("/peminjaman", { params: { limit: 200 } });
+  const hitung = {};
+  semua.forEach((r) => { hitung[r.status] = (hitung[r.status] || 0) + 1; });
+  tampilStats(hitung);
+
+  renderTable($("#saya"), [
+    { h: "Ruangan", f: (r) => `${esc(r.ruangan)}<div class="sub">${esc(r.gedung)}</div>` },
+    { h: "Waktu", f: (r) => `${fmtDT(r.mulai)}<div class="sub">s/d ${fmtTime(r.selesai)}</div>` },
+    { h: "Status", f: (r) => badge(r.status) },
+  ], semua.slice(0, 6), "Kamu belum punya peminjaman.");
+});
+{% endif %}
 </script>
 {% endblock %}

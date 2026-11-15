@@ -55,3 +55,14 @@ class PeminjamanIn(BaseModel):
 class StatusIn(BaseModel):
     status: Status
     catatan_admin: Optional[str] = None
+
+
+class RegisterIn(BaseModel):
+    nama: str
+    email: str
+    password: str
+    no_hp: Optional[str] = None
+
+class LoginIn(BaseModel):
+    email: str
+    password: str

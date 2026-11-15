@@ -4,7 +4,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Ruangan</h1>
-  <button class="btn primary" id="btnBaru">+ Tambah ruangan</button>
+  {% if user.role == 'admin' %}<button class="btn primary" id="btnBaru">+ Tambah ruangan</button>{% endif %}
 </div>
 
 <section class="card">
@@ -63,6 +63,7 @@
 
 {% block scripts %}
 <script>
+const ADMIN = ME.role === "admin";
 let rows = [], gedung = [], editId = null, jadwalId = null;
 const form = $("#form");
 
@@ -84,8 +85,8 @@ async function load() {
     { h: "Status", f: (r) => r.aktif ? badge("aktif") : badge("nonaktif") },
     { h: "", f: (r) => `<div class="actions">
         <button class="btn sm" data-act="jadwal" data-id="${r.id}">Jadwal</button>
-        <button class="btn sm" data-act="edit" data-id="${r.id}">Ubah</button>
-        <button class="btn sm danger" data-act="hapus" data-id="${r.id}">Hapus</button></div>` },
+        ${ADMIN ? `<button class="btn sm" data-act="edit" data-id="${r.id}">Ubah</button>
+        <button class="btn sm danger" data-act="hapus" data-id="${r.id}">Hapus</button>` : ""}</div>` },
   ], rows, "Tidak ada ruangan yang cocok.");
 }
 
@@ -111,7 +112,7 @@ async function muatJadwal() {
     : `<p class="empty">Tidak ada jadwal pada tanggal ini. Ruangan kosong.</p>`;
 }
 
-$("#btnBaru").onclick = () => buka(null);
+if ($("#btnBaru")) $("#btnBaru").onclick = () => buka(null);
 $("#btnFilter").onclick = () => guard(load);
 
 $("#tbl").addEventListener("click", (e) => {

@@ -3,16 +3,27 @@ from pathlib import Path
 from typing import Optional
 
 import bcrypt
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from psycopg2 import errors
+from starlette.middleware.sessions import SessionMiddleware
 
 from database import get_cursor
-from schemas import GedungIn, PeminjamanIn, RuanganIn, StatusIn, UserIn, UserUpdate
+from schemas import (
+    GedungIn,
+    LoginIn,
+    PeminjamanIn,
+    RegisterIn,
+    RuanganIn,
+    StatusIn,
+    UserIn,
+    UserUpdate,
+)
 
 app = FastAPI(title="API Peminjaman Ruangan Kampus")
+app.add_middleware(SessionMiddleware, secret_key="abc")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -43,6 +54,20 @@ def wants_html(request: Request) -> bool:
 
 def render(request: Request, name: str, **context):
     return templates.TemplateResponse(request, name, context)
+
+
+def halaman(request: Request, name: str, active: str, admin_only: bool = False):
+    """Render halaman dengan guard role.
+    - belum login            -> redirect /login
+    - butuh admin, bukan admin -> redirect /
+    Variabel `user` tersedia di template (mis. {% if user.role == 'admin' %}...{% endif %}).
+    """
+    u = request.session.get("user")
+    if not u:
+        return RedirectResponse("/login", status_code=303)
+    if admin_only and u["role"] != "admin":
+        return RedirectResponse("/", status_code=303)
+    return render(request, name, active=active, user=u)
 
 
 # ---------- error handler untuk constraint / trigger database ----------
@@ -88,6 +113,30 @@ def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
 
+# ---------- auth / RBAC ----------
+def current_user(request: Request):
+    u = request.session.get("user")
+    if not u:
+        raise HTTPException(401, "Belum login")
+    return u
+
+
+def require_admin(user=Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(403, "Khusus admin")
+    return user
+
+
+def is_admin(user) -> bool:
+    return user["role"] == "admin"
+
+
+def cek_pemilik(user, owner_id: int):
+    """Admin boleh semua; peminjam cuma boleh data miliknya sendiri."""
+    if not is_admin(user) and owner_id != user["id"]:
+        raise HTTPException(403, "Bukan peminjaman milik kamu")
+
+
 USER_COLS = "id, nama, email, role, no_hp, created_at"  # password_hash TIDAK PERNAH dikembalikan
 
 RUANGAN_SELECT = """
@@ -124,14 +173,66 @@ def cek_ruangan_layak(cur, ruangan_id: int, jumlah_peserta: int):
         raise HTTPException(400, f"Jumlah peserta ({jumlah_peserta}) melebihi kapasitas ruangan ({r['kapasitas']})")
 
 
-# ====================== HALAMAN UTAMA ======================
+# ====================== HALAMAN UTAMA & AUTH ======================
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def halaman_index(request: Request):
-    return render(request, "index.html", active="index")
+    return halaman(request, "index.html", "index")
+
+
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def halaman_login(request: Request):
+    if request.session.get("user"):
+        return RedirectResponse("/", status_code=303)
+    return render(request, "login.html", active="login")
+
+
+@app.get("/register", response_class=HTMLResponse, include_in_schema=False)
+def halaman_register(request: Request):
+    if request.session.get("user"):
+        return RedirectResponse("/", status_code=303)
+    return render(request, "register.html", active="register")
+
+
+@app.post("/auth/register", status_code=201, tags=["auth"])
+def register(data: RegisterIn):
+    """Register publik: role SELALU 'peminjam'. Admin hanya dibuat lewat POST /users oleh admin."""
+    with get_cursor() as cur:
+        cur.execute(
+            f"""INSERT INTO users (nama, email, password_hash, role, no_hp)
+                VALUES (%s, %s, %s, 'peminjam', %s) RETURNING {USER_COLS}""",
+            (data.nama, data.email, hash_password(data.password), data.no_hp),
+        )
+        return cur.fetchone()
+
+
+@app.post("/auth/login", tags=["auth"])
+def login(data: LoginIn, request: Request):
+    with get_cursor() as cur:
+        cur.execute(f"SELECT {USER_COLS}, password_hash FROM users WHERE email = %s", (data.email,))
+        u = cur.fetchone()
+    try:
+        ok = bool(u) and bcrypt.checkpw(data.password.encode(), u["password_hash"].encode())
+    except ValueError:  # hash placeholder di data seed
+        ok = False
+    if not ok:
+        raise HTTPException(401, "Email atau password salah")
+    request.session["user"] = {"id": u["id"], "nama": u["nama"], "role": u["role"]}
+    return request.session["user"]
+
+
+@app.post("/auth/logout", tags=["auth"])
+def logout(request: Request):
+    request.session.clear()
+    return {"detail": "Logout berhasil"}
+
+
+@app.get("/auth/me", tags=["auth"])
+def me(user=Depends(current_user)):
+    return user
 
 
 # ====================== GEDUNG ======================
-@app.post("/gedung", status_code=201, tags=["gedung"])
+@app.post("/gedung", status_code=201, tags=["gedung"], dependencies=[Depends(require_admin)])
 def tambah_gedung(data: GedungIn):
     with get_cursor() as cur:
         cur.execute("INSERT INTO gedung (kode, nama) VALUES (%s, %s) RETURNING *", (data.kode, data.nama))
@@ -141,27 +242,28 @@ def tambah_gedung(data: GedungIn):
 @app.get("/gedung", tags=["gedung"])
 def daftar_gedung(request: Request):
     if wants_html(request):
-        return render(request, "gedung.html", active="gedung")
+        return halaman(request, "gedung.html", "gedung", admin_only=True)
+    current_user(request)  # semua yang login boleh lihat daftar gedung (buat dropdown dll)
     with get_cursor() as cur:
         cur.execute("SELECT * FROM gedung ORDER BY kode")
         return cur.fetchall()
 
 
-@app.get("/gedung/{id}", tags=["gedung"])
+@app.get("/gedung/{id}", tags=["gedung"], dependencies=[Depends(current_user)])
 def detail_gedung(id: int):
     with get_cursor() as cur:
         cur.execute("SELECT * FROM gedung WHERE id = %s", (id,))
         return one_or_404(cur, "Gedung")
 
 
-@app.put("/gedung/{id}", tags=["gedung"])
+@app.put("/gedung/{id}", tags=["gedung"], dependencies=[Depends(require_admin)])
 def ubah_gedung(id: int, data: GedungIn):
     with get_cursor() as cur:
         cur.execute("UPDATE gedung SET kode=%s, nama=%s WHERE id=%s RETURNING *", (data.kode, data.nama, id))
         return one_or_404(cur, "Gedung")
 
 
-@app.delete("/gedung/{id}", tags=["gedung"])
+@app.delete("/gedung/{id}", tags=["gedung"], dependencies=[Depends(require_admin)])
 def hapus_gedung(id: int):
     with get_cursor() as cur:
         cur.execute("DELETE FROM gedung WHERE id = %s RETURNING id", (id,))
@@ -170,7 +272,7 @@ def hapus_gedung(id: int):
 
 
 # ====================== RUANGAN ======================
-@app.post("/ruangan", status_code=201, tags=["ruangan"])
+@app.post("/ruangan", status_code=201, tags=["ruangan"], dependencies=[Depends(require_admin)])
 def tambah_ruangan(data: RuanganIn):
     with get_cursor() as cur:
         cur.execute(
@@ -189,7 +291,8 @@ def daftar_ruangan(
     aktif: Optional[bool] = None,
 ):
     if wants_html(request):
-        return render(request, "ruangan.html", active="ruangan")
+        return halaman(request, "ruangan.html", "ruangan")  # peminjam boleh lihat; tombol CRUD disembunyikan di template
+    current_user(request)
     conds, params = [], []
     if gedung_id is not None:
         conds.append("r.gedung_id = %s")
@@ -206,7 +309,7 @@ def daftar_ruangan(
         return cur.fetchall()
 
 
-@app.get("/ruangan/tersedia", tags=["ruangan"])
+@app.get("/ruangan/tersedia", tags=["ruangan"], dependencies=[Depends(current_user)])
 def ruangan_tersedia(mulai: datetime, selesai: datetime, min_kapasitas: Optional[int] = None):
     """Ruangan aktif yang kosong (tidak ada diajukan/disetujui) pada rentang waktu itu. Logika sama dengan no_bentrok."""
     if selesai <= mulai:
@@ -227,13 +330,13 @@ def ruangan_tersedia(mulai: datetime, selesai: datetime, min_kapasitas: Optional
         return cur.fetchall()
 
 
-@app.get("/ruangan/{id}", tags=["ruangan"])
+@app.get("/ruangan/{id}", tags=["ruangan"], dependencies=[Depends(current_user)])
 def detail_ruangan(id: int):
     with get_cursor() as cur:
         return get_ruangan(cur, id)
 
 
-@app.put("/ruangan/{id}", tags=["ruangan"])
+@app.put("/ruangan/{id}", tags=["ruangan"], dependencies=[Depends(require_admin)])
 def ubah_ruangan(id: int, data: RuanganIn):
     with get_cursor() as cur:
         cur.execute(
@@ -245,7 +348,7 @@ def ubah_ruangan(id: int, data: RuanganIn):
         return get_ruangan(cur, id)
 
 
-@app.delete("/ruangan/{id}", tags=["ruangan"])
+@app.delete("/ruangan/{id}", tags=["ruangan"], dependencies=[Depends(require_admin)])
 def hapus_ruangan(id: int):
     """Gagal (409) kalau ruangan pernah dipinjam (ON DELETE RESTRICT). Untuk menonaktifkan, ubah aktif=false lewat PUT."""
     with get_cursor() as cur:
@@ -254,7 +357,7 @@ def hapus_ruangan(id: int):
     return {"detail": "Ruangan dihapus"}
 
 
-@app.get("/ruangan/{id}/jadwal", tags=["ruangan"])
+@app.get("/ruangan/{id}/jadwal", tags=["ruangan"], dependencies=[Depends(current_user)])
 def jadwal_ruangan(id: int, tanggal: date):
     """Jadwal aktif (diajukan + disetujui) yang menyentuh tanggal tersebut, dari view v_jadwal_aktif."""
     with get_cursor() as cur:
@@ -268,8 +371,8 @@ def jadwal_ruangan(id: int, tanggal: date):
         return cur.fetchall()
 
 
-# ====================== USERS ======================
-@app.post("/users", status_code=201, tags=["users"])
+# ====================== USERS (admin only) ======================
+@app.post("/users", status_code=201, tags=["users"], dependencies=[Depends(require_admin)])
 def tambah_user(data: UserIn):
     with get_cursor() as cur:
         cur.execute(
@@ -283,7 +386,8 @@ def tambah_user(data: UserIn):
 @app.get("/users", tags=["users"])
 def daftar_user(request: Request, role: Optional[str] = None):
     if wants_html(request):
-        return render(request, "users.html", active="users")
+        return halaman(request, "users.html", "users", admin_only=True)
+    require_admin(current_user(request))
     with get_cursor() as cur:
         if role:
             cur.execute(f"SELECT {USER_COLS} FROM users WHERE role = %s ORDER BY nama", (role,))
@@ -292,14 +396,14 @@ def daftar_user(request: Request, role: Optional[str] = None):
         return cur.fetchall()
 
 
-@app.get("/users/{id}", tags=["users"])
+@app.get("/users/{id}", tags=["users"], dependencies=[Depends(require_admin)])
 def detail_user(id: int):
     with get_cursor() as cur:
         cur.execute(f"SELECT {USER_COLS} FROM users WHERE id = %s", (id,))
         return one_or_404(cur, "User")
 
 
-@app.put("/users/{id}", tags=["users"])
+@app.put("/users/{id}", tags=["users"], dependencies=[Depends(require_admin)])
 def ubah_user(id: int, data: UserUpdate):
     with get_cursor() as cur:
         if data.password:
@@ -317,7 +421,7 @@ def ubah_user(id: int, data: UserUpdate):
         return one_or_404(cur, "User")
 
 
-@app.delete("/users/{id}", tags=["users"])
+@app.delete("/users/{id}", tags=["users"], dependencies=[Depends(require_admin)])
 def hapus_user(id: int):
     with get_cursor() as cur:
         cur.execute("DELETE FROM users WHERE id = %s RETURNING id", (id,))
@@ -327,14 +431,15 @@ def hapus_user(id: int):
 
 # ====================== PEMINJAMAN ======================
 @app.post("/peminjaman", status_code=201, tags=["peminjaman"])
-def ajukan_peminjaman(data: PeminjamanIn):
-    """Status awal selalu 'diajukan'. Bentrok jadwal ditolak oleh constraint no_bentrok (409)."""
+def ajukan_peminjaman(data: PeminjamanIn, user=Depends(current_user)):
+    """Status awal selalu 'diajukan'. Peminjam: user_id diambil dari login. Admin: boleh atas nama user lain."""
+    uid = data.user_id if is_admin(user) else user["id"]
     with get_cursor() as cur:
         cek_ruangan_layak(cur, data.ruangan_id, data.jumlah_peserta)
         cur.execute(
             """INSERT INTO peminjaman (user_id, ruangan_id, keperluan, jumlah_peserta, mulai, selesai)
                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-            (data.user_id, data.ruangan_id, data.keperluan, data.jumlah_peserta, data.mulai, data.selesai),
+            (uid, data.ruangan_id, data.keperluan, data.jumlah_peserta, data.mulai, data.selesai),
         )
         return get_peminjaman(cur, cur.fetchone()["id"])
 
@@ -350,7 +455,10 @@ def daftar_peminjaman(
     offset: int = Query(0, ge=0),
 ):
     if wants_html(request):
-        return render(request, "peminjaman.html", active="peminjaman")
+        return halaman(request, "peminjaman.html", "peminjaman")
+    user = current_user(request)
+    if not is_admin(user):
+        user_id = user["id"]  # peminjam hanya melihat miliknya sendiri
     conds, params = [], []
     if user_id is not None:
         conds.append("user_id = %s")
@@ -374,54 +482,66 @@ def daftar_peminjaman(
 
 
 @app.get("/peminjaman/{id}", tags=["peminjaman"])
-def detail_peminjaman(id: int):
+def detail_peminjaman(id: int, user=Depends(current_user)):
     with get_cursor() as cur:
-        return get_peminjaman(cur, id)
+        row = get_peminjaman(cur, id)
+        cek_pemilik(user, row["user_id"])
+        return row
 
 
 @app.get("/peminjaman/{id}/log", tags=["peminjaman"])
-def log_peminjaman(id: int):
+def log_peminjaman(id: int, user=Depends(current_user)):
     """Riwayat perubahan status (diisi otomatis oleh trigger trg_log_status)."""
     with get_cursor() as cur:
-        get_peminjaman(cur, id)
+        row = get_peminjaman(cur, id)
+        cek_pemilik(user, row["user_id"])
         cur.execute("SELECT * FROM log_status WHERE peminjaman_id = %s ORDER BY waktu, id", (id,))
         return cur.fetchall()
 
 
 @app.put("/peminjaman/{id}", tags=["peminjaman"])
-def ubah_peminjaman(id: int, data: PeminjamanIn):
-    """Hanya boleh diubah selama masih 'diajukan'."""
+def ubah_peminjaman(id: int, data: PeminjamanIn, user=Depends(current_user)):
+    """Hanya boleh diubah selama masih 'diajukan'. Pemilik atau admin."""
     with get_cursor() as cur:
-        cur.execute("SELECT status FROM peminjaman WHERE id = %s FOR UPDATE", (id,))
+        cur.execute("SELECT status, user_id FROM peminjaman WHERE id = %s FOR UPDATE", (id,))
         lama = one_or_404(cur, "Peminjaman")
+        cek_pemilik(user, lama["user_id"])
         if lama["status"] != "diajukan":
             raise HTTPException(409, "Hanya peminjaman berstatus 'diajukan' yang bisa diubah")
+        uid = data.user_id if is_admin(user) else user["id"]
         cek_ruangan_layak(cur, data.ruangan_id, data.jumlah_peserta)
         cur.execute(
             """UPDATE peminjaman SET user_id=%s, ruangan_id=%s, keperluan=%s, jumlah_peserta=%s,
                    mulai=%s, selesai=%s, updated_at=now() WHERE id=%s""",
-            (data.user_id, data.ruangan_id, data.keperluan, data.jumlah_peserta, data.mulai, data.selesai, id),
+            (uid, data.ruangan_id, data.keperluan, data.jumlah_peserta, data.mulai, data.selesai, id),
         )
         return get_peminjaman(cur, id)
 
 
 @app.patch("/peminjaman/{id}/status", tags=["peminjaman"])
-def ubah_status(id: int, data: StatusIn):
+def ubah_status(id: int, data: StatusIn, user=Depends(current_user)):
+    """Admin: semua transisi yang valid. Peminjam: hanya membatalkan peminjaman miliknya."""
     with get_cursor() as cur:
-        cur.execute("SELECT status FROM peminjaman WHERE id = %s FOR UPDATE", (id,))
-        lama = one_or_404(cur, "Peminjaman")["status"]
+        cur.execute("SELECT status, user_id FROM peminjaman WHERE id = %s FOR UPDATE", (id,))
+        row = one_or_404(cur, "Peminjaman")
+        lama = row["status"]
+        if not is_admin(user):
+            cek_pemilik(user, row["user_id"])
+            if data.status != "dibatalkan":
+                raise HTTPException(403, "Peminjam hanya boleh membatalkan peminjamannya")
         if data.status not in TRANSISI[lama]:
             boleh = ", ".join(sorted(TRANSISI[lama])) or "(tidak ada, status sudah final)"
             raise HTTPException(409, f"Status '{lama}' tidak bisa menjadi '{data.status}'. Yang diizinkan: {boleh}")
+        catatan = data.catatan_admin if is_admin(user) else None
         cur.execute(
             """UPDATE peminjaman SET status = %s, catatan_admin = COALESCE(%s, catatan_admin),
                    updated_at = now() WHERE id = %s""",
-            (data.status, data.catatan_admin, id),
+            (data.status, catatan, id),
         )
         return get_peminjaman(cur, id)
 
 
-@app.delete("/peminjaman/{id}", tags=["peminjaman"])
+@app.delete("/peminjaman/{id}", tags=["peminjaman"], dependencies=[Depends(require_admin)])
 def hapus_peminjaman(id: int):
     """Hapus permanen (log_status ikut terhapus via CASCADE). Untuk membatalkan, lebih baik pakai PATCH status."""
     with get_cursor() as cur:
@@ -430,8 +550,8 @@ def hapus_peminjaman(id: int):
     return {"detail": "Peminjaman dihapus"}
 
 
-# ====================== LAPORAN ======================
-@app.get("/laporan/ruangan-terpopuler", tags=["laporan"])
+# ====================== LAPORAN (admin only) ======================
+@app.get("/laporan/ruangan-terpopuler", tags=["laporan"], dependencies=[Depends(require_admin)])
 def ruangan_terpopuler(limit: int = Query(5, ge=1, le=50)):
     with get_cursor() as cur:
         cur.execute(
@@ -449,7 +569,7 @@ def ruangan_terpopuler(limit: int = Query(5, ge=1, le=50)):
         return cur.fetchall()
 
 
-@app.get("/laporan/rekap-status", tags=["laporan"])
+@app.get("/laporan/rekap-status", tags=["laporan"], dependencies=[Depends(require_admin)])
 def rekap_status():
     with get_cursor() as cur:
         cur.execute("SELECT status, COUNT(*) AS jumlah FROM peminjaman GROUP BY status ORDER BY jumlah DESC")

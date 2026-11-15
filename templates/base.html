@@ -6,17 +6,25 @@
   <title>{% block title %}Dashboard{% endblock %} · Peminjaman Ruangan Kampus</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-user='{{ user | tojson if user else "null" }}'>
   <header class="topbar">
     <div class="topbar-inner">
       <a class="brand" href="/">Peminjaman Ruangan</a>
+      {% if user %}
       <nav>
-        <a href="/" class="{{ 'active' if active == 'dashboard' }}">Dashboard</a>
-        <a href="/peminjaman" class="{{ 'active' if active == 'peminjaman' }}">Peminjaman</a>
+        <a href="/" class="{{ 'active' if active == 'index' }}">Dashboard</a>
+        <a href="/peminjaman" class="{{ 'active' if active == 'peminjaman' }}">{{ 'Peminjaman' if user.role == 'admin' else 'Peminjaman saya' }}</a>
         <a href="/ruangan" class="{{ 'active' if active == 'ruangan' }}">Ruangan</a>
+        {% if user.role == 'admin' %}
         <a href="/gedung" class="{{ 'active' if active == 'gedung' }}">Gedung</a>
         <a href="/users" class="{{ 'active' if active == 'users' }}">Pengguna</a>
+        {% endif %}
       </nav>
+      <div style="margin-left:auto;display:flex;gap:.75rem;align-items:center">
+        <span>{{ user.nama }} <small>({{ user.role }})</small></span>
+        <button class="btn sm" id="btnLogout">Keluar</button>
+      </div>
+      {% endif %}
     </div>
   </header>
 
@@ -25,7 +33,15 @@
   </main>
 
   <div id="toasts" class="toasts"></div>
+  <script>const ME = JSON.parse(document.body.dataset.user);</script>
   <script src="/static/app.js"></script>
+  <script>
+    const _btnLogout = document.getElementById("btnLogout");
+    if (_btnLogout) _btnLogout.addEventListener("click", async () => {
+      await fetch("/auth/logout", { method: "POST" });
+      location.href = "/login";
+    });
+  </script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
